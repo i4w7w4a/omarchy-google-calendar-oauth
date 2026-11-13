@@ -1,0 +1,25 @@
+{
+  "version": "0.14.9",
+  "source": "https://github.com/t4t5/caldir",
+  "commit": "bb853f0266629fa8eab3d8103dced92e8fbf71f0",
+  "provider_patch": "patches/caldir-single-insert.patch",
+  "source_archive_sha256": "b9464d8295047ede2a16e705285fd38c1d47ffe644036470f450e45972a4cfe3",
+  "assets": {
+    "x86_64": {
+      "url": "https://github.com/t4t5/caldir/releases/download/v0.14.9/caldir-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "c0c6cd5ef0eb0982e2e48b5e8037c71104e9184695e1e0885c14cc3c2689095c",
+      "binaries": {
+        "caldir": "c0788534a6e8e542f567d9499e39579bcb749e1c6f34c918605a65c63655d8b0",
+        "caldir-provider-google": "f1c99da1f6badcceaf5bd2cb55b6a52de7a81d510f98755be0006367c762a2c2"
+      }
+    },
+    "aarch64": {
+      "url": "https://github.com/t4t5/caldir/releases/download/v0.14.9/caldir-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "c549179e8c36b1e75c692494aaedcdd14937140701d325c07443410efb997a85",
+      "binaries": {
+        "caldir": "be28ff94c3f7298254b0676a590cbd44124503518d3714d5508671de43df86e1",
+        "caldir-provider-google": "a644eb164c402fc43c2adf09ad075f6d186e3b9bfd39f00a8b9c36bcc9aae378"
+      }
+    }
+  }
+}

@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Edit or delete the chosen local event or recurring occurrence."""
+
+from __future__ import annotations
+
+import re
+import sys
+from datetime import datetime, timedelta
+from uuid import uuid4
+
+from calendar_snapshot import refresh_after_local_change
+from calendar_store import (
+    CLOCK, DEFAULT_DURATION, RRULE, CalendarError, absolute, add_elapsed,
+    calendar_directory, calendar_lock, config, duration_request, elapsed, escape_text,
+    event_bounds, event_duration, event_files, event_identity, event_time, handle_error, instance_identity,
+    is_date, is_google, json_input, json_output, local_zone, localize, property_indexes,
+    property_line, property_name, property_value, read_lines, recurrence_id, reminder_request,
+    require_google_roundtrip, require_writable, revision, set_event_times, set_property, set_reminder, split_property,
+    text_value, time_value, validate_title,
+)
+from calendar_sync import content_fingerprint, date_bounds, load_queue, push, recover_attempts, recover_preparation, write_local
+
+
+def locate_events(path, uid):
+    matches = {}
+    for file in event_files(path):
+        lines = read_lines(file)
+        identity, rid = event_identity(lines)
+        if identity == uid:
+            if rid in matches:
+                raise CalendarError("More than one local event has the selected identity")
+            matches[rid] = (file, lines)
+    if "" not in matches:
+        raise CalendarError("Could not find the selected local event")
+    return matches
+
+
+def occurrence_token(request, uid):
+    identity = text_value(request, "instance_id", limit=2048)
+    if not identity.startswith(uid + "__"):
+        raise CalendarError("The occurrence has no recurrence identity", 64)
+    token = identity[len(uid) + 2:]
+    parts, separator, value = token.rpartition(":")
+    if separator and (not parts.startswith("TZID=") or any(character in parts for character in ';"')):
+        raise CalendarError("Invalid recurrence time zone", 64)
+    moment = event_time("RECURRENCE-ID;" + parts + ":" + value if separator else "RECURRENCE-ID:" + value)
+    rid = instance_identity(uid, token)[1]
+    return moment, rid
+
+
+def instant_from_text(request, key):
+    value = text_value(request, key, limit=64)
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")) if "T" in value else datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as error:
+        raise CalendarError("The selected event has an invalid date", 64) from error
+
+
+def updated_times(start, duration, new_all_day, clock, requested):
+    if not start:
+        raise CalendarError("The selected event has no start date")
+    source_all_day = is_date(start)
+    zone = local_zone()
+    displayed = start if source_all_day else absolute(start).astimezone(zone)
+    day = displayed if source_all_day else displayed.date()
+    if new_all_day:
+        count = max(1, duration.days) if source_all_day and duration else 1
+        return day, day + timedelta(days=count), not source_all_day
+    if not CLOCK.fullmatch(clock):
+        raise CalendarError("Time must be HH:MM", 64)
+    clock_changed = source_all_day or clock != displayed.strftime("%H:%M")
+    if clock_changed:
+        new_start = localize(datetime.fromisoformat(f"{day}T{clock}"), zone, strict=True)
+        if not source_all_day:
+            new_start = new_start.astimezone(start.tzinfo) if start.tzinfo else new_start.replace(tzinfo=None)
+    else:
+        new_start = start
+    if requested is not None:
+        duration = timedelta(minutes=requested)
+    elif source_all_day or duration is None or duration <= timedelta(0):
+        duration = timedelta(minutes=DEFAULT_DURATION)
+    return new_start, add_elapsed(new_start, duration), clock_changed
+
+
+def migrate_recurrence_value(line, old_start, new_start):
+    moment = event_time(line)
+    if is_date(old_start):
+        original_day = moment if is_date(moment) else moment.date()
+        offset = original_day - old_start
+    elif is_date(moment):
+        offset = moment - old_start.date()
+    else:
+        original_day = moment.astimezone(old_start.tzinfo).date() if moment.tzinfo and old_start.tzinfo else moment.date()
+        offset = original_day - old_start.date()
+    if is_date(new_start):
+        return new_start + offset
+    candidate = new_start.replace(tzinfo=None) + offset
+    return localize(candidate, new_start.tzinfo) if new_start.tzinfo else candidate
+
+
+def update_recurrence_dates(lines, old_start, new_start):
+    for index in property_indexes(lines):
+        name = property_name(lines[index])
+        if name not in {"EXDATE", "RDATE"}:
+            continue
+        head, values = split_property(lines[index])
+        if any("/" in value for value in values.split(",")):
+            raise CalendarError("This series has recurrence periods the clock cannot move safely")
+        converted = [time_value(migrate_recurrence_value(head + ":" + value, old_start, new_start))
+                     for value in values.split(",")]
+        params = converted[0][1]
+        if any(item[1] != params for item in converted):
+            raise CalendarError("These recurrence dates use different time zones")
+        lines[index] = name + params + ":" + ",".join(item[0] for item in converted)
+
+
+def edit_event(path, matches, occurrence, request, settings):
+    title = validate_title(request)
+    all_day = request.get("all_day")
+    if type(all_day) is not bool:
+        raise CalendarError("Invalid all-day setting", 64)
+    clock = text_value(request, "time", limit=5)
+    rule = text_value(request, "recurrence_rule", "keep", 100)
+    if rule != "keep" and (occurrence or not RRULE.fullmatch(rule)):
+        raise CalendarError("Invalid event recurrence", 64)
+    description = text_value(request, "description", limit=10000, multiline=True)
+    duration = duration_request(request)
+    reminder = reminder_request(request, "keep")
+    master_file, master_lines = matches[""]
+    master_kind = property_value(master_lines, "X-GOOGLE-EVENT-TYPE")
+    if master_kind not in (None, "default", "birthday"):
+        raise CalendarError("This Google event is read-only")
+    if master_kind == "birthday":
+        if occurrence:
+            raise CalendarError("A birthday can only be renamed as a series")
+        changed = master_lines.copy()
+        set_property(changed, "SUMMARY", escape_text(title))
+        if changed == master_lines:
+            return {}
+        if is_google(settings):
+            require_google_roundtrip(changed)
+        revision(changed)
+        return {master_file: changed}
+
+    if occurrence:
+        original, rid = occurrence
+        if not property_value(master_lines, "RRULE"):
+            raise CalendarError("This event is not a recurring series")
+        override = matches.get(rid)
+        if override:
+            file, source = override
+            lines = source.copy()
+            start = event_time(property_line(lines, "DTSTART"))
+            previous_duration = event_duration(lines)
+        else:
+            file = path / ("override-" + uuid4().hex + ".ics")
+            source = master_lines
+            lines = source.copy()
+            for name in ("RRULE", "RDATE", "EXRULE", "EXDATE"):
+                set_property(lines, name, None)
+            set_property(lines, "RECURRENCE-ID", *time_value(original))
+            start = original
+            previous_duration = event_duration(master_lines)
+            if previous_duration is None:
+                previous_duration = elapsed(instant_from_text(request, "start"), instant_from_text(request, "end"))
+    else:
+        file, source = master_file, master_lines
+        lines = source.copy()
+        start = event_time(property_line(lines, "DTSTART"))
+        previous_duration = event_duration(lines)
+
+    new_start, new_end, clock_changed = updated_times(start, previous_duration, all_day, clock, duration)
+    if not occurrence and clock_changed and property_value(lines, "RRULE"):
+        # Materialized Google overrides own their provider IDs. Changing the
+        # series clock would move those identities to other remote instances.
+        if len(matches) > 1:
+            raise CalendarError("Change the time of a series with edited occurrences in Google Calendar")
+        if is_date(start) != is_date(new_start) and "UNTIL=" in (property_value(lines, "RRULE") or "").upper() and rule == "keep":
+            raise CalendarError("Choose a new repeat schedule when converting this series between timed and all-day")
+        update_recurrence_dates(lines, start, new_start)
+    if clock_changed or duration is not None or (occurrence and rid not in matches):
+        set_event_times(lines, new_start, new_end)
+    set_property(lines, "SUMMARY", escape_text(title))
+    if "description" in request:
+        set_property(lines, "DESCRIPTION", escape_text(description) if description else None)
+    if "location" in request:
+        location = text_value(request, "location", limit=4096)
+        set_property(lines, "LOCATION", escape_text(location) if location else None)
+    if rule != "keep":
+        set_property(lines, "RRULE", rule)
+    set_reminder(lines, reminder, is_google(settings))
+    if lines == source:
+        return {}
+    if is_google(settings):
+        require_google_roundtrip(lines)
+        organizer = (property_value(source, "ORGANIZER") or "").casefold().removeprefix("mailto:")
+        account = settings["remote"].get("google_account", "").casefold()
+        is_invite = account and organizer != account and any(
+            property_name(source[index]) == "ATTENDEE"
+            and split_property(source[index])[1].casefold().removeprefix("mailto:") == account
+            for index in property_indexes(source)
+        )
+        if is_invite and any(property_value(lines, name) != property_value(source, name)
+                             for name in ("SUMMARY", "DESCRIPTION", "LOCATION", "DTSTART", "DTEND", "RRULE")):
+            raise CalendarError("Only personal reminders can be changed for an invitation from another organizer")
+    revision(lines)
+    return {file: lines}
+
+
+def delete_event(matches, occurrence, uid):
+    if not occurrence:
+        return {file: None for file, _ in matches.values()}
+    original, rid = occurrence
+    file, source = matches[""]
+    if not property_value(source, "RRULE"):
+        raise CalendarError("This event is not a recurring series")
+    if property_value(source, "X-GOOGLE-EVENT-TYPE") not in (None, "default"):
+        raise CalendarError("This Google event is read-only")
+    lines = source.copy()
+    for index in property_indexes(lines):
+        if property_name(lines[index]) == "EXDATE":
+            head, values = split_property(lines[index])
+            if any(instance_identity(uid, recurrence_id(head + ":" + value))[1] == rid for value in values.split(",")):
+                return {}
+    _, end = event_bounds(lines)
+    value, params = time_value(original)
+    lines.insert(end, "EXDATE" + params + ":" + value)
+    revision(lines)
+    changes = {file: lines}
+    if rid in matches:
+        changes[matches[rid][0]] = None
+    return changes
+
+
+def parse_legacy(args):
+    action, *rest = args or [""]
+    if action == "delete" and len(rest) == 5 and rest[-1] == "--confirm":
+        keys = ("scope", "calendar", "uid", "instance_id")
+        return {**dict(zip(keys, rest)), "action": action, "confirm": True, "auto_push": True}
+    if action == "edit" and len(rest) == 11 and rest[6] in {"true", "false"}:
+        keys = ("scope", "calendar", "uid", "instance_id", "start", "end", "all_day", "title", "time", "recurrence_rule", "description")
+        request = dict(zip(keys, rest))
+        return {**request, "action": action, "all_day": request["all_day"] == "true", "auto_push": True}
+    raise CalendarError("Usage: calendar-mutate --stdin", 64)
+
+
+def mutate(request):
+    action = request.get("action")
+    scope = request.get("scope")
+    uid = text_value(request, "uid")
+    if action not in ("edit", "delete") or scope not in ("instance", "series") or not uid:
+        raise CalendarError("Invalid calendar mutation request", 64)
+    if action == "delete" and request.get("confirm") is not True:
+        raise CalendarError("Calendar deletion requires confirmation", 64)
+    root, _ = config()
+    state = load_queue()
+    recover_preparation(state, root)
+    recover_attempts(state, root)
+    path = calendar_directory(root, request.get("calendar"))
+    settings = require_writable(path)
+    matches = locate_events(path, uid)
+    occurrence = occurrence_token(request, uid) if scope == "instance" else None
+    expected = request.get("expected_revision")
+    if expected is not None:
+        current = matches.get(occurrence[1], matches[""]) if occurrence else matches[""]
+        if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise CalendarError("Invalid event revision", 64)
+        if content_fingerprint(current[1]) != expected:
+            raise CalendarError("This event changed while the editor was open. Reopen it to edit the current version.", 75, "stale_revision")
+    if action == "delete":
+        if property_value(matches[""][1], "X-GOOGLE-EVENT-TYPE") not in (None, "default"):
+            raise CalendarError("This Google event is read-only")
+        changes = delete_event(matches, occurrence, uid)
+        if is_google(settings):
+            for lines in changes.values():
+                if lines is not None:
+                    require_google_roundtrip(lines)
+    else:
+        changes = edit_event(path, matches, occurrence, request, settings)
+    status = write_local(path, settings, changes)
+    result = {"ok": True, "sync": status}
+    if status == "pending" and request.get("auto_push") is True:
+        try:
+            result["sync"], _ = push(automatic=True)
+        except CalendarError:
+            pass
+    refresh_after_local_change(result, (date_bounds(lines) for lines in changes.values() if lines is not None))
+    return result
+
+
+def main():
+    structured = sys.argv[1:] == ["--stdin"]
+    try:
+        request = json_input() if structured else parse_legacy(sys.argv[1:])
+        with calendar_lock(wait=False):
+            result = mutate(request)
+        if structured:
+            json_output(result)
+        else:
+            print("Deleted event locally" if request["action"] == "delete" else "Updated event locally")
+        return 0
+    except (CalendarError, OSError, ValueError, OverflowError) as error:
+        return handle_error(error, structured)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

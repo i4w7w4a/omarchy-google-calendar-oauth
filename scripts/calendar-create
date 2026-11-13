@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Create one complete local iCalendar event before scheduling its push."""
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from calendar_snapshot import refresh_after_local_change
+from calendar_store import (
+    CLOCK, DEFAULT_DURATION, CalendarError, add_elapsed, bounded_integer, calendar_directory,
+    calendar_lock, config, duration_request, escape_text, handle_error, is_google, iso_date,
+    json_input, json_output, local_zone, localize, reminder_request, require_writable, set_event_times,
+    set_reminder, text_value, validate_title,
+)
+from calendar_sync import load_queue, push, recover_attempts, recover_preparation, write_local
+
+
+def create(request):
+    title = validate_title(request)
+    day = iso_date(request.get("date"))
+    clock = text_value(request, "time", limit=5)
+    repeat = request.get("repeat", "none")
+    if repeat not in ("none", "daily", "weekly", "monthly", "yearly"):
+        raise CalendarError("Invalid event recurrence", 64)
+    count = request.get("count")
+    if count is not None and count != "":
+        if repeat == "none":
+            raise CalendarError("Repeat count requires a recurrence", 64)
+        if isinstance(count, str) and len(count) <= 3 and count.isascii() and count.isdigit():
+            count = int(count)
+        bounded_integer(count, 2, 999, "Repeat count")
+    description = text_value(request, "description", limit=10000, multiline=True)
+    location = text_value(request, "location", limit=4096)
+    reminder = reminder_request(request, "default")
+    if reminder["mode"] == "keep":
+        raise CalendarError("A new event has no previous reminder", 64)
+    duration = duration_request(request) or DEFAULT_DURATION
+    if clock:
+        if not CLOCK.fullmatch(clock):
+            raise CalendarError("Time must be HH:MM", 64)
+        start = localize(datetime.fromisoformat(f"{day}T{clock}"), local_zone(), strict=True)
+        end = add_elapsed(start, timedelta(minutes=duration))
+    else:
+        start, end = day, day + timedelta(days=1)
+
+    root, slug = config()
+    state = load_queue()
+    recover_preparation(state, root)
+    recover_attempts(state, root)
+    path = calendar_directory(root, request.get("calendar", slug))
+    settings = require_writable(path)
+    uid = uuid4().hex + "@caldir"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:CALDIR", "BEGIN:VEVENT", f"UID:{uid}",
+             f"DTSTAMP:{stamp}", "SUMMARY:" + escape_text(title), "END:VEVENT", "END:VCALENDAR"]
+    if description:
+        lines.insert(-2, "DESCRIPTION:" + escape_text(description))
+    if location:
+        lines.insert(-2, "LOCATION:" + escape_text(location))
+    if repeat != "none":
+        rule = "FREQ=" + repeat.upper()
+        if count:
+            rule += f";COUNT={count}"
+        lines.insert(-2, "RRULE:" + rule)
+    set_event_times(lines, start, end)
+    set_reminder(lines, reminder, is_google(settings))
+    file = path / (day.isoformat() + "__" + uid.split("@", 1)[0] + ".ics")
+    return write_local(path, settings, {file: lines}), day, uid
+
+
+def main():
+    structured = sys.argv[1:] == ["--stdin"]
+    try:
+        if structured:
+            request = json_input()
+        elif len(sys.argv) == 7:
+            request = dict(zip(("title", "date", "time", "repeat", "count", "description"), sys.argv[1:]))
+            request["auto_push"] = True
+        else:
+            raise CalendarError("Usage: calendar-create --stdin", 64)
+        with calendar_lock(wait=False):
+            status, day, uid = create(request)
+            if status == "pending" and request.get("auto_push") is True:
+                try:
+                    status, _ = push(automatic=True)
+                except CalendarError:
+                    status = "pending"
+            result = {"ok": True, "sync": status, "uid": uid}
+            refresh_after_local_change(result, [(day.isoformat(), day.isoformat())])
+        if structured:
+            json_output(result)
+        else:
+            print("Saved event" if status == "synced" else "Saved event locally")
+        return 0
+    except (CalendarError, OSError, ValueError, OverflowError) as error:
+        return handle_error(error, structured)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

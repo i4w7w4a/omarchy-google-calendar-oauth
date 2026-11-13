@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+from calendar_snapshot import read_cache
+from calendar_store import json_output
+
+json_output(read_cache())

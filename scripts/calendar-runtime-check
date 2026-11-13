@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[[ $("$script_dir/calendar-caldir" --version 2>/dev/null) == "caldir-cli 0.14.9" ]]

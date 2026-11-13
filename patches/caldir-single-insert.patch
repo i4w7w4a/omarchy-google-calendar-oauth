@@ -1,0 +1,302 @@
+diff --git i/caldir-provider-google/src/commands/create_event.rs w/caldir-provider-google/src/commands/create_event.rs
+index 07dfbde..866b04a 100644
+--- i/caldir-provider-google/src/commands/create_event.rs
++++ w/caldir-provider-google/src/commands/create_event.rs
+@@ -1,8 +1,9 @@
+-use anyhow::{Context, Result};
++use anyhow::{Context, Result, bail};
+ use caldir_core::Event;
+ use caldir_core::provider::ProviderStorage;
+ use caldir_core::rpc::CreateEvent;
+-use google_calendar::types::SendUpdates;
++use reqwest::Client;
++use url::Url;
+ 
+ use crate::app_config::AppConfigStore;
+ use crate::commands::invite::patch_invite_personal_fields;
+@@ -13,6 +14,9 @@ use crate::google_event::{FromGoogle, ToGoogle};
+ use crate::remote_config::GoogleRemoteConfig;
+ use crate::session::SessionStore;
+ 
++const CALENDAR_API: &str = "https://www.googleapis.com/calendar/v3/";
++const UNKNOWN_RESULT: &str = "Google event creation outcome unknown";
++
+ pub async fn handle(cmd: CreateEvent) -> Result<Event> {
+     let config = GoogleRemoteConfig::try_from(&cmd.remote)?;
+     let account_email = &config.google_account;
+@@ -25,7 +29,6 @@ pub async fn handle(cmd: CreateEvent) -> Result<Event> {
+     let session = session_store
+         .load_valid(account_email, &app_config_store)
+         .await?;
+-    let client = session_store.client(&session, &app_config_store)?;
+ 
+     // Recurring instance override:
+     // Shares the master's iCalUID, so creating via events().insert() trips Google's "duplicate identifier" check.
+@@ -65,89 +68,197 @@ pub async fn handle(cmd: CreateEvent) -> Result<Event> {
+         }
+     }
+ 
+-    // Let google change the ID
+-    // (Otherwise we'll get "Invalid resource id value")
+-    let mut google_event = cmd.event.to_google();
+-    google_event.id = String::new();
+-
+-    let response = match client
+-        .events()
+-        .insert(
+-            calendar_id,
+-            1,
+-            0,
+-            false,
+-            SendUpdates::All,
+-            false,
+-            &google_event,
+-        )
+-        .await
+-    {
+-        Ok(response) => Ok(response),
+-        Err(error)
+-            if google_event.conference_data.is_some() && is_conference_data_error(&error) =>
+-        {
+-            eprintln!(
+-                "caldir-provider-google: warning: Google rejected conference data; \
+-                 retrying without it: {error}"
+-            );
+-            google_event.conference_data = None;
+-
+-            client
+-                .events()
+-                .insert(
+-                    calendar_id,
+-                    1,
+-                    0,
+-                    false,
+-                    SendUpdates::All,
+-                    false,
+-                    &google_event,
+-                )
+-                .await
+-        }
+-        Err(error) => Err(error),
+-    }
+-    .with_context(|| format!("Failed to create event: {}", google_event.summary))?;
+-
+-    let created_event = Event::from_google(response.body)?;
+-
+-    Ok(created_event)
++    let url = insert_url(Url::parse(CALENDAR_API)?, calendar_id)?;
++    insert_once(url, session.access_token(), &cmd.event).await
+ }
+ 
+-fn is_conference_data_error(error: &google_calendar::ClientError) -> bool {
+-    match error {
+-        google_calendar::ClientError::HttpError { error, .. } => {
+-            error.to_ascii_lowercase().contains("conference")
+-        }
+-        _ => false,
++fn insert_url(mut base: Url, calendar_id: &str) -> Result<Url> {
++    if matches!(calendar_id, "" | "." | "..") {
++        bail!("Invalid Google calendar ID");
+     }
++    base.path_segments_mut()
++        .map_err(|_| anyhow::anyhow!("Invalid Calendar API URL"))?
++        .pop_if_empty()
++        .extend(["calendars", calendar_id, "events"]);
++    base.query_pairs_mut()
++        .append_pair("conferenceDataVersion", "1")
++        .append_pair("sendUpdates", "all");
++    Ok(base)
++}
++
++async fn insert_once(url: Url, token: &str, event: &Event) -> Result<Event> {
++    // Preserve Caldir's iCalUID. The SDK retries POST even when it was accepted.
++    let mut body = event.to_google();
++    body.id.clear();
++    let client = Client::builder()
++        .retry(reqwest::retry::never())
++        .redirect(reqwest::redirect::Policy::none())
++        .no_proxy()
++        .build()?;
++    let request = client
++        .post(url)
++        .bearer_auth(token)
++        .header(reqwest::header::ACCEPT, "application/json")
++        .json(&body)
++        .build()?;
++    let response = client.execute(request).await.context(UNKNOWN_RESULT)?;
++    let status = response.status();
++    if matches!(
++        status.as_u16(),
++        400 | 401 | 403 | 404 | 405 | 410 | 413 | 415 | 422 | 429
++    ) {
++        bail!("Google rejected event creation (HTTP {})", status.as_u16());
++    }
++    if !status.is_success() {
++        bail!("{UNKNOWN_RESULT} (HTTP {})", status.as_u16());
++    }
++    let created: google_calendar::types::Event = response.json().await.context(UNKNOWN_RESULT)?;
++    if created.id.is_empty() || created.i_cal_uid != event.uid.as_str() {
++        bail!("{UNKNOWN_RESULT} (unexpected event identity)");
++    }
++    Event::from_google(created).context(UNKNOWN_RESULT)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use google_calendar::{ClientError, HeaderMap, StatusCode};
++    use caldir_core::{EventTime, EventUid, XProperty};
++    use chrono::NaiveDate;
++    use serde_json::{Value, json};
++    use std::io::{BufRead, BufReader, Read, Write};
++    use std::net::{TcpListener, TcpStream};
++    use std::time::Duration;
+ 
+-    fn http_error(message: &str) -> ClientError {
+-        ClientError::HttpError {
+-            status: StatusCode::BAD_REQUEST,
+-            headers: HeaderMap::new(),
+-            error: message.to_string(),
++    fn request(stream: &mut TcpStream) -> Value {
++        stream
++            .set_read_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        let mut reader = BufReader::new(stream);
++        let mut line = String::new();
++        reader.read_line(&mut line).unwrap();
++        assert_eq!(
++            line,
++            "POST /calendars/team%2Fcal/events?conferenceDataVersion=1&sendUpdates=all HTTP/1.1\r\n"
++        );
++        let mut length = 0;
++        loop {
++            line.clear();
++            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
++            if line == "\r\n" {
++                break;
++            }
++            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
++                length = value.trim().parse().unwrap();
++            }
++        }
++        let mut body = vec![0; length];
++        reader.read_exact(&mut body).unwrap();
++        serde_json::from_slice(&body).unwrap()
++    }
++
++    async fn fake_insert(response: Option<(u16, &'static str, String)>) -> Result<Event> {
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = listener.local_addr().unwrap();
++        let server = std::thread::spawn(move || {
++            let (mut socket, _) = listener.accept().unwrap();
++            let body = request(&mut socket);
++            assert_eq!(body["iCalUID"], "calendar-test@caldir");
++            assert!(!body.as_object().unwrap().contains_key("id"));
++            if let Some((code, headers, body)) = response {
++                write!(socket, "HTTP/1.1 {code} Test\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{body}", body.len()).unwrap();
++            }
++            drop(socket);
++            // Fail on a repeat, including a redirect followed as a second POST.
++            listener.set_nonblocking(true).unwrap();
++            let deadline = std::time::Instant::now() + Duration::from_secs(2);
++            while std::time::Instant::now() < deadline {
++                match listener.accept() {
++                    Ok(_) => panic!("event insert was retried"),
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                        std::thread::sleep(Duration::from_millis(10));
++                    }
++                    Err(error) => panic!("failed to inspect requests: {error}"),
++                }
++            }
++        });
++
++        let base = Url::parse(&format!("http://{address}/")).unwrap();
++        let url = insert_url(base, "team/cal").unwrap();
++        let mut event = Event::new(
++            "Test",
++            EventTime::Date(NaiveDate::from_ymd_opt(2026, 11, 13).unwrap()),
++        );
++        event.uid = EventUid::new("calendar-test@caldir");
++        event.x_properties = vec![XProperty::new(
++            crate::constants::GOOGLE_EVENT_ID_PROPERTY,
++            "old-id",
++        )];
++        let result = tokio::time::timeout(Duration::from_secs(5), insert_once(url, "test", &event))
++            .await
++            .unwrap();
++        server.join().unwrap();
++        result
++    }
++
++    #[tokio::test]
++    async fn insert_preserves_ical_uid_and_uses_returned_google_id() {
++        let body = json!({"id":"googleid", "iCalUID":"calendar-test@caldir", "summary":"Test",
++            "start":{"date":"2026-11-13"}, "end":{"date":"2026-11-14"}});
++        let event = fake_insert(Some((200, "", body.to_string())))
++            .await
++            .unwrap();
++        assert_eq!(event.uid.as_str(), "calendar-test@caldir");
++        assert_eq!(
++            event.x_property(crate::constants::GOOGLE_EVENT_ID_PROPERTY),
++            Some("googleid")
++        );
++    }
++
++    #[tokio::test]
++    async fn insert_is_not_retried_on_transient_status_or_redirect() {
++        for (code, headers) in [
++            (503, ""),
++            (307, "Location: /calendars/team%2Fcal/events\r\n"),
++            (408, ""),
++        ] {
++            let error = fake_insert(Some((code, headers, "{}".into())))
++                .await
++                .unwrap_err();
++            assert_eq!(error.to_string(), format!("{UNKNOWN_RESULT} (HTTP {code})"));
+         }
+     }
+ 
+-    #[test]
+-    fn identifies_conference_data_errors_for_insert_retry() {
+-        let error = http_error(r#"{"error":{"message":"Invalid conferenceData value"}}"#);
+-
+-        assert!(is_conference_data_error(&error));
++    #[tokio::test]
++    async fn ambiguous_disconnect_or_invalid_success_body_remains_unknown() {
++        for response in [None, Some((200, "", "truncated".into()))] {
++            assert_eq!(
++                fake_insert(response).await.unwrap_err().to_string(),
++                UNKNOWN_RESULT
++            );
++        }
++        let body = json!({"id":"googleid", "iCalUID":"different@caldir", "summary":"Test",
++            "start":{"date":"2026-11-13"}, "end":{"date":"2026-11-14"}});
++        let error = fake_insert(Some((200, "", body.to_string())))
++            .await
++            .unwrap_err();
++        assert_eq!(
++            error.to_string(),
++            format!("{UNKNOWN_RESULT} (unexpected event identity)")
++        );
+     }
+ 
+-    #[test]
+-    fn does_not_retry_unrelated_insert_errors() {
+-        let error = http_error(r#"{"error":{"message":"Invalid attendee email"}}"#);
+-
+-        assert!(!is_conference_data_error(&error));
++    #[tokio::test]
++    async fn validation_rejection_is_reported_without_another_insert() {
++        let error = fake_insert(Some((
++            400,
++            "",
++            r#"{"error":{"message":"Invalid conferenceData value"}}"#.into(),
++        )))
++        .await
++        .unwrap_err();
++        assert_eq!(
++            error.to_string(),
++            "Google rejected event creation (HTTP 400)"
++        );
+     }
+ }

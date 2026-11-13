@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (($# < 1 || $# > 2)) || [[ -z $1 ]]; then
+  echo "Usage: calendar-notify <headline> [description]" >&2
+  exit 64
+fi
+headline=$1
+body=${2:-}
+# The notification CLI accepts flags after its positional text.
+[[ $headline != -* ]] || headline=$'\u2060'$headline
+[[ $body != -* ]] || body=$'\u2060'$body
+args=(-g "󰃭" -u normal --app-name "re_pick.google-calendar-clock" "$headline")
+[[ -z $body ]] || args+=("$body")
+exec omarchy notification send "${args[@]}" --exec omarchy-shell shell summon re_pick.google-calendar-clock '{}'

@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Non-secret status of the dedicated GNOME Online Accounts connection."""
+import json
+import os
+from pathlib import Path
+import sys
+import calendar_goa
+
+if sys.argv[1:] not in (["status"], ["status", "--json"], ["--json"]):
+    raise SystemExit("Use setup to connect Google through Online Accounts")
+root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-calendar"
+linked=(root/'goa.json').is_file() and not (root/'goa.json').is_symlink()
+if linked:
+    try:
+        identity=json.loads((root/'goa.json').read_text()).get('identity')
+        linked=identity in calendar_goa.accounts()
+    except Exception:
+        linked=False
+print(json.dumps({"mode":"goa" if linked else "none","session":"","app_config":False}))

@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Refresh the shared local snapshot, optionally downloading a range first."""
+import sys
+
+from calendar_snapshot import cache_range, refresh_cache
+from calendar_store import CalendarError, calendar_lock, handle_error
+from calendar_sync import pull
+
+try:
+    args = sys.argv[1:]
+    with calendar_lock(wait=False):
+        if args[:1] == ["--pull"]:
+            args = args[1:]
+            start, end = cache_range(args)
+            if args:
+                start, end = args
+            pull(("--from", start, "--to", end))
+        print(refresh_cache(args))
+except (CalendarError, OSError, ValueError) as error:
+    raise SystemExit(handle_error(error))

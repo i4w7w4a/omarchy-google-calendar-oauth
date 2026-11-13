@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Read local Caldir events for an ISO date range."""
+import sys
+
+from calendar_snapshot import snapshot
+from calendar_store import CalendarError, calendar_lock, iso_date, json_output
+
+try:
+    if len(sys.argv) != 3:
+        raise CalendarError("Expected two calendar range dates")
+    start, end = (iso_date(value) for value in sys.argv[1:])
+    if start > end:
+        raise CalendarError("Calendar range starts after it ends")
+    with calendar_lock(wait=False):
+        json_output(snapshot(start.isoformat(), end.isoformat()))
+except (CalendarError, OSError, ValueError) as error:
+    json_output({"ok": False, "error": str(error)})

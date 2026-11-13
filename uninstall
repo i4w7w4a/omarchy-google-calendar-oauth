@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Restore the stock clock and archive this plugin; never remove calendar data."""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+
+PLUGIN_ID = 're_pick.google-calendar-clock'
+config_root = Path.home() / '.config'
+state_root = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state'))
+config_file = config_root / 'omarchy/shell.json'
+plugin = config_root / 'omarchy/plugins' / PLUGIN_ID
+os.umask(0o077)
+if config_file.is_symlink() or plugin.is_symlink():
+    raise SystemExit('Отказ: неожиданный символьный путь конфигурации.')
+original = config_file.read_bytes()
+config = json.loads(original)
+backups = state_root / 'omarchy-project/backups'
+backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+backup = Path(tempfile.mkdtemp(prefix=time.strftime('%Y%m%d-%H%M%S-calendar-remove-'), dir=backups))
+(backup / 'shell.json').write_bytes(original)
+clock_keys = {'format','formatAlt','verticalFormat','verticalFormatAlt','weekStartDay','birthYear','lifeExpectancy'}
+for section, entries in config.get('bar', {}).get('layout', {}).items():
+    for i, entry in enumerate(entries):
+        normalized={'id':entry} if isinstance(entry,str) else entry
+        if normalized.get('id') == PLUGIN_ID:
+            entries[i] = {'id':'omarchy.clock', **{k:v for k,v in normalized.items() if k in clock_keys}}
+if config.get('bar', {}).get('centerAnchor') == PLUGIN_ID:
+    config['bar']['centerAnchor'] = 'omarchy.clock'
+config['disabledPlugins'] = [x for x in config.get('disabledPlugins',[]) if x not in ('omarchy.clock',PLUGIN_ID)]
+config['plugins'] = [x for x in config.get('plugins',[]) if (x if isinstance(x,str) else x.get('id')) != PLUGIN_ID]
+if config_file.read_bytes() != original:
+    raise SystemExit('Конфигурация изменилась одновременно; повторите удаление.')
+with tempfile.NamedTemporaryFile('w',dir=config_file.parent,delete=False) as stream:
+    json.dump(config,stream,ensure_ascii=False,indent=2)
+    stream.write('\n')
+    temporary = Path(stream.name)
+temporary.chmod(config_file.stat().st_mode & 0o777)
+temporary.replace(config_file)
+subprocess.run(['omarchy','shell','shell','reloadConfig'],check=False,stdout=subprocess.DEVNULL)
+if plugin.exists():
+    shutil.move(str(plugin),str(backup / PLUGIN_ID))
+subprocess.run(['omarchy','shell','shell','rescanPlugins'],check=False,stdout=subprocess.DEVNULL)
+print('Штатные часы возвращены. Плагин перенесён в:',backup)
+print('События, учётные данные Google и Caldir сохранены.')

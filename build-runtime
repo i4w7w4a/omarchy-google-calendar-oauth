@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+export PATH=/usr/bin:/bin
+
+if (($# != 1)) || [[ -z $1 ]]; then
+  echo 'Usage: build-runtime OUTPUT_PATH' >&2
+  exit 64
+fi
+output_dir=$(realpath -e -- "$(dirname -- "$1")")
+output=$output_dir/$(basename -- "$1")
+[[ -d $output_dir && ! -d $output ]] || { echo 'Expected an existing output directory' >&2; exit 64; }
+
+for command in bwrap cargo cc curl git rustc; do
+  command -v "$command" >/dev/null || { echo "Required build command is missing: $command" >&2; exit 127; }
+done
+
+plugin_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+patch=$plugin_dir/patches/caldir-single-insert.patch
+source_commit=bb853f0266629fa8eab3d8103dced92e8fbf71f0
+source_sha256=b9464d8295047ede2a16e705285fd38c1d47ffe644036470f450e45972a4cfe3
+patch_sha256=5f8c967ccb1da6406e8648bdd894aac957a0cb72c8ac8fff6c742de1eaca8d64
+
+verify() {
+  printf '%s  %s\n' "$1" "$2" | sha256sum --check --status || {
+    echo "SHA-256 check failed: $2" >&2
+    exit 1
+  }
+}
+
+verify "$patch_sha256" "$patch"
+work=$(mktemp -d /var/tmp/omarchy-caldir-build.XXXXXXXX)
+temporary=
+cleanup() {
+  rm -rf -- "$work"
+  if [[ -n $temporary ]]; then rm -f -- "$temporary"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p -- "$work"/{src,cargo,target}
+
+sandbox=(bwrap --unshare-all --die-with-parent --clearenv
+  --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin
+  --proc /proc --dev /dev --tmpfs /tmp --dir "$HOME"
+  --setenv HOME "$HOME" --setenv PATH /usr/bin:/bin --setenv LANG C.UTF-8)
+"${sandbox[@]}" /usr/bin/true || { echo 'Bubblewrap isolation is unavailable' >&2; exit 1; }
+
+env -i PATH=/usr/bin:/bin /usr/bin/curl --disable --silent --show-error --fail \
+  --location --proto '=https' --proto-redir '=https' --max-time 45 --max-filesize 8388608 \
+  "https://codeload.github.com/t4t5/caldir/tar.gz/$source_commit" -o "$work/source.tar.gz"
+verify "$source_sha256" "$work/source.tar.gz"
+env -i PATH=/usr/bin:/bin /usr/bin/tar -xzf "$work/source.tar.gz" \
+  --directory "$work/src" --strip-components=1 --no-same-owner --no-same-permissions
+env -i PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+  /usr/bin/git -C "$work/src" apply --whitespace=error "$patch"
+
+target=$(env -i PATH=/usr/bin:/bin /usr/bin/rustc --print host-tuple)
+# Cargo fetch downloads the locked dependencies without executing build scripts.
+(
+  cd -- "$work/src"
+  nice -n 10 env -i CARGO_HOME="$work/cargo" PATH=/usr/bin:/bin LANG=C.UTF-8 \
+    CARGO_HTTP_TIMEOUT=45 CARGO_NET_RETRY=2 /usr/bin/cargo fetch --locked --target "$target"
+)
+
+compile=(nice -n 10 "${sandbox[@]}" --ro-bind "$work/src" /src --ro-bind "$work/cargo" /cargo
+  --bind "$work/target" /target --setenv CARGO_HOME /cargo --setenv CARGO_TARGET_DIR /target
+  --chdir /src /usr/bin/cargo)
+"${compile[@]}" test --locked --offline --release --jobs 4 --target "$target" --package caldir-provider-google
+"${compile[@]}" build --locked --offline --release --jobs 4 --target "$target" --package caldir-provider-google
+
+temporary=$(mktemp --tmpdir="$output_dir" .caldir-provider-google.XXXXXXXX)
+install -m 0755 -- "$work/target/$target/release/caldir-provider-google" "$temporary"
+mv -fT -- "$temporary" "$output"
+temporary=

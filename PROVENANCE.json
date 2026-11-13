@@ -1,0 +1,13 @@
+{
+  "upstream": "https://github.com/NachoRodriguezM/omarchy-google-calendar-clock",
+  "upstream_version": "0.2.0",
+  "upstream_commit": "fc3285de075d9db8060107e7b9cd2431ec31e1b1",
+  "local_plugin": "re_pick.google-calendar-clock",
+  "local_version": "1.1",
+  "caldir_source": "https://github.com/t4t5/caldir",
+  "caldir_version": "0.14.9",
+  "caldir_commit": "bb853f0266629fa8eab3d8103dced92e8fbf71f0",
+  "oauth": "GNOME Online Accounts; temporary access-token adapter; no Google Cloud project and no Caldir.org relay",
+  "runtime_hashes": "runtime.json",
+  "public_repository": "https://github.com/i4w7w4a/omarchy-google-calendar-oauth"
+}

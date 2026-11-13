@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Open GNOME Online Accounts with the system browser or an explicit local choice."""
+from __future__ import annotations
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+def browser_choice(config_root):
+    path=config_root/'omarchy-calendar/browser.json'
+    if not path.exists():return None
+    if path.is_symlink() or path.stat().st_size>16384:
+        raise RuntimeError('Invalid calendar browser preference')
+    value=json.loads(path.read_text())
+    executable=value.get('executable')
+    arguments=value.get('arguments',[])
+    if not isinstance(executable,str) or not Path(executable).is_absolute() or not Path(executable).is_file() or not os.access(executable,os.X_OK):
+        raise RuntimeError('The selected calendar sign-in browser is unavailable')
+    if not isinstance(arguments,list) or len(arguments)>8 or any(not isinstance(x,str) or len(x)>512 or any(ord(c)<32 for c in x) for x in arguments):
+        raise RuntimeError('Invalid calendar browser arguments')
+    return {'executable':executable,'arguments':arguments}
+
+
+def main():
+    original=os.environ.copy()
+    config_root=Path(original.get('XDG_CONFIG_HOME',Path.home()/'.config'))
+    choice=browser_choice(config_root)
+    from gi.repository import Gio,GLib
+    bus=Gio.bus_get_sync(Gio.BusType.SESSION,None)
+    owned=bus.call_sync('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','NameHasOwner',GLib.Variant('(s)',('org.x.GnomeOnlineAccountsGtk',)),None,Gio.DBusCallFlags.NONE,5000,None).unpack()[0]
+    if owned:
+        if choice is None:
+            print('Online Accounts is already open. Choose Google in Providers.')
+            return 10
+        pid=bus.call_sync('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','GetConnectionUnixProcessID',GLib.Variant('(s)',('org.x.GnomeOnlineAccountsGtk',)),None,Gio.DBusCallFlags.NONE,5000,None).unpack()[0]
+        entries=Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+        selected=next((x.split(b'=',1)[1].decode() for x in entries if x.startswith(b'XDG_CONFIG_HOME=')),'')
+        selected_path=Path(selected)
+        runtime_root=Path(original.get('XDG_RUNTIME_DIR',''))
+        marker=selected_path.parent/'browser-choice.json'
+        if selected_path.parent.parent==runtime_root and selected_path.parent.name.startswith('calendar-login-') and marker.is_file() and json.loads(marker.read_text())==choice:
+            print('Online Accounts is already open with the selected browser.')
+            return 10
+        raise RuntimeError('Close the existing Online Accounts window and connect again to use the selected browser')
+    if choice is None:
+        return subprocess.run(['/usr/bin/gnome-online-accounts-gtk'],check=False).returncode
+    runtime=Path(original.get('XDG_RUNTIME_DIR',''))
+    if not runtime.is_absolute() or not runtime.is_dir() or runtime.stat().st_uid!=os.getuid():
+        raise RuntimeError('A user runtime directory is required')
+    with tempfile.TemporaryDirectory(prefix='calendar-login-',dir=runtime) as temporary:
+        root=Path(temporary)
+        config=root/'config';data=root/'data';apps=data/'applications'
+        config.mkdir(mode=0o700);apps.mkdir(parents=True,mode=0o700)
+        (root/'browser-choice.json').write_text(json.dumps(choice))
+        launcher=root/'browser'
+        restore={k:original.get(k,str(Path.home()/('.config' if k=='XDG_CONFIG_HOME' else '.local/share'))) for k in ('XDG_CONFIG_HOME','XDG_DATA_HOME')}
+        argv=[choice['executable'],*choice['arguments']]
+        launcher.write_text('#!/usr/bin/python3\nimport json,os,sys\nenv=os.environ.copy()\nenv.update(json.loads('+repr(json.dumps(restore))+'))\nargv=json.loads('+repr(json.dumps(argv))+')\nos.execve(argv[0],[*argv,*sys.argv[1:]],env)\n')
+        launcher.chmod(0o700)
+        desktop='calendar-oauth-browser.desktop'
+        (apps/desktop).write_text('[Desktop Entry]\nType=Application\nName=Calendar OAuth Browser\nExec='+str(launcher)+' %u\nMimeType=x-scheme-handler/http;x-scheme-handler/https;\nNoDisplay=true\n')
+        (config/'mimeapps.list').write_text('[Default Applications]\nx-scheme-handler/http='+desktop+'\nx-scheme-handler/https='+desktop+'\n')
+        env=original.copy();env['XDG_CONFIG_HOME']=str(config);env['XDG_DATA_HOME']=str(data)
+        return subprocess.run(['/usr/bin/gnome-online-accounts-gtk'],env=env,check=False).returncode
+
+
+if __name__=='__main__':
+    try:raise SystemExit(main())
+    except (OSError,ValueError,RuntimeError) as error:raise SystemExit(str(error)) from None

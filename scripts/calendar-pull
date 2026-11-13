@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Download Caldir changes while no plugin mutation is waiting for Google."""
+import sys
+
+from calendar_snapshot import refresh_cache
+from calendar_store import CalendarError, calendar_lock, handle_error, iso_date
+from calendar_sync import pull
+
+try:
+    args = sys.argv[1:]
+    default_window = args[:1] == ["--pending"]
+    if default_window:
+        args = args[1:]
+    if len(args) not in ((0, 2) if default_window else (2,)):
+        raise CalendarError("Usage: calendar-pull [--pending] [YYYY-MM-DD YYYY-MM-DD]", 64)
+    if args and iso_date(args[0]) > iso_date(args[1]):
+        raise CalendarError("Calendar range starts after it ends", 64)
+    with calendar_lock(wait=False):
+        if default_window:
+            pull(())
+        if args:
+            pull(("--from", args[0], "--to", args[1]))
+        print(refresh_cache(args))
+except (CalendarError, OSError, ValueError) as error:
+    raise SystemExit(handle_error(error))

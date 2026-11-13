@@ -1,0 +1,258 @@
+#!/usr/bin/python3
+"""Allow a pinned Caldir provider to write only the events in one push plan."""
+
+import ctypes
+from datetime import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import re
+import resource
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from calendar_store import (
+    CalendarError, ICAL_DATE, ICAL_TIME, MAX_ICS_BYTES, event_identity, property_indexes,
+    property_line, property_name, split_property, sync_directory, unfold,
+)
+
+PLAN_ENV = "OMARCHY_CALENDAR_PUSH_PLAN"
+PROVIDER_ENV = "OMARCHY_CALENDAR_REAL_GOOGLE_PROVIDER"
+READS = {"list_events", "list_calendars"}
+WRITES = {"create_event", "update_event", "delete_event"}
+INSERT_REFUSED = re.compile(r"Google rejected event creation \(HTTP (?:400|401|403|404|405|410|413|415|422|429)\)")
+MAX_REQUEST = MAX_ICS_BYTES * 6 + 8192
+MAX_PLAN = 4 * 1024 * 1024
+MAX_RESPONSE = 16 * 1024 * 1024
+PR_SET_PDEATHSIG = 1
+LIBC = ctypes.CDLL(None)
+
+
+class GateError(Exception):
+    pass
+
+
+def unique_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise GateError("Duplicate key in provider JSON")
+        result[key] = value
+    return result
+
+
+def json_object(data):
+    try:
+        result = json.loads(data, object_pairs_hook=unique_keys)
+    except (ValueError, RecursionError) as error:
+        raise GateError("Invalid provider JSON") from error
+    if not isinstance(result, dict):
+        raise GateError("Expected a provider JSON object")
+    return result
+
+
+def text_field(value, limit, *, empty=False):
+    return (isinstance(value, str) and (empty or value != "") and len(value) <= limit
+            and not re.search(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]", value))
+
+
+def open_private(path, flags, mode):
+    descriptor = os.open(path, flags | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise GateError("The calendar push plan or receipt is not private")
+        return os.fdopen(descriptor, mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def load_plan():
+    path = Path(os.environ.get(PLAN_ENV, ""))
+    if not path.is_absolute():
+        raise GateError("A private calendar push plan is required")
+    with open_private(path, os.O_RDONLY, "rb") as stream:
+        data = stream.read(MAX_PLAN + 1)
+    if len(data) > MAX_PLAN:
+        raise GateError("The calendar push plan is too large")
+    plan = json_object(data)
+    account, calendar, allowed = (plan.get(key) for key in ("google_account", "google_calendar_id", "allow"))
+    if (not text_field(account, 512) or not text_field(calendar, 1024)
+            or not isinstance(allowed, list) or len(allowed) > 10000):
+        raise GateError("Invalid calendar push plan")
+    intents = set()
+    for row in allowed:
+        if not isinstance(row, dict):
+            raise GateError("Invalid calendar push intent")
+        action, uid, recurrence = (row.get(key) for key in ("action", "uid", "recurrence"))
+        if (not isinstance(action, str) or action not in WRITES or not text_field(uid, 1024)
+                or not text_field(recurrence, 96, empty=True)):
+            raise GateError("Invalid calendar push intent")
+        intents.add((action, uid, recurrence))
+    return (account, calendar), intents, path.with_name(path.name + ".receipt")
+
+
+def check_recurrence(line):
+    if line is None:
+        return
+    head, value = split_property(line)
+    if head.upper() in {"RECURRENCE-ID", "RECURRENCE-ID;VALUE=DATE"} and ICAL_DATE.fullmatch(value):
+        return
+    if head.upper() == "RECURRENCE-ID" and ICAL_TIME.fullmatch(value):
+        return
+    zoned = re.fullmatch(r"RECURRENCE-ID;TZID=([A-Za-z0-9_+./-]+)", head, re.IGNORECASE)
+    if zoned and ICAL_TIME.fullmatch(value) and not value.endswith("Z"):
+        try:
+            zone = ZoneInfo(zoned[1])
+            moment = datetime.strptime(value, "%Y%m%dT%H%M%S")
+            first = moment.replace(tzinfo=zone, fold=0)
+            second = moment.replace(tzinfo=zone, fold=1)
+            if first.utcoffset() == second.utcoffset():
+                return
+        except (ValueError, ZoneInfoNotFoundError):
+            pass
+    # The Google provider falls back to UTC for ambiguous or nonexistent
+    # wall times. Do not authorize an instance under a different interpretation.
+    raise GateError("The Google provider recurrence identity is ambiguous")
+
+
+def ics_identity(event):
+    if not isinstance(event, str) or len(event) > MAX_ICS_BYTES:
+        raise GateError("Invalid event in the provider request")
+    try:
+        if len(event.encode()) > MAX_ICS_BYTES:
+            raise GateError("Invalid event in the provider request")
+        lines = unfold(event)
+        keys = [property_name(lines[index]) for index in property_indexes(lines)]
+        if keys.count("UID") != 1 or keys.count("RECURRENCE-ID") > 1:
+            raise GateError("Ambiguous event identity in the provider request")
+        check_recurrence(property_line(lines, "RECURRENCE-ID"))
+        uid, recurrence = event_identity(lines)
+    except (CalendarError, UnicodeError, ValueError) as error:
+        raise GateError("Invalid event identity in the provider request") from error
+    if not text_field(uid, 1024) or not text_field(recurrence, 96, empty=True):
+        raise GateError("Invalid event identity in the provider request")
+    return uid, recurrence
+
+
+def journal(path, intent, status):
+    action, uid, recurrence = intent
+    with open_private(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, "a+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        if status == "started":
+            if os.fstat(stream.fileno()).st_size > MAX_RESPONSE:
+                raise GateError("The calendar push receipt is too large")
+            stream.seek(0)
+            for line in stream:
+                prior = json_object(line)
+                if (prior.get("uid"), prior.get("recurrence"), prior.get("status")) == (uid, recurrence, "started"):
+                    status = "rejected"
+                    break
+        row = {"action": action, "uid": uid, "recurrence": recurrence, "status": status}
+        stream.write(json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode() + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        sync_directory(path.parent)
+    return status
+
+
+def provider_path():
+    path = Path(os.environ.get(PROVIDER_ENV, ""))
+    if (not path.is_absolute() or path.is_symlink() or not path.is_file()
+            or not os.access(path, os.X_OK) or path.resolve() == Path(__file__).resolve()):
+        raise GateError("The pinned Google provider is unavailable")
+    return path
+
+
+def forward(raw):
+    path = provider_path()
+    parent = os.getpid()
+    env = os.environ.copy()
+    env.pop(PLAN_ENV, None)
+    env.pop(PROVIDER_ENV, None)
+
+    def limit_child():
+        # Caldir can kill the proxy at its RPC timeout. Stop the real provider
+        # with it, even though Caldir only owns the proxy process directly.
+        if LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+            os._exit(125)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_RESPONSE, MAX_RESPONSE))
+
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run([str(path)], input=raw, stdout=output, env=env, timeout=42,
+                                preexec_fn=limit_child, check=False)
+        output.seek(0)
+        response = output.read(MAX_RESPONSE + 1)
+    if result.returncode != 0 or len(response) > MAX_RESPONSE:
+        raise GateError("The Google provider did not return a complete response")
+    return response
+
+
+def handle(raw):
+    request = json_object(raw)
+    action = request.get("command")
+    params = request.get("params")
+    if not isinstance(action, str) or not isinstance(params, dict):
+        raise GateError("Invalid Google provider request")
+    if action in READS:
+        return forward(raw)
+    if action not in WRITES:
+        raise GateError("This Google provider operation is not allowed")
+
+    uid, recurrence = ics_identity(params.get("event"))
+    intent = action, uid, recurrence
+    scope, allowed, receipt = load_plan()
+    if (params.get("google_account"), params.get("google_calendar_id")) != scope or intent not in allowed:
+        journal(receipt, intent, "rejected")
+        raise GateError("The Google calendar change is outside the push plan")
+    provider_path()
+    if journal(receipt, intent, "started") != "started":
+        raise GateError("The Google calendar change was already attempted in this push")
+
+    status = "error"
+    try:
+        response = forward(raw)
+        value = json_object(response)
+        if value.get("status") == "success" and "data" in value:
+            if action == "delete_event":
+                if value["data"] is not None:
+                    raise GateError("The Google provider returned an invalid deletion receipt")
+            else:
+                ics_identity(value["data"])
+            status = "success"
+        elif value.get("status") != "error" or not isinstance(value.get("error"), str):
+            raise GateError("The Google provider returned an invalid write receipt")
+        elif action == "create_event" and not recurrence and INSERT_REFUSED.fullmatch(value["error"]):
+            status = "refused"
+        return response
+    finally:
+        journal(receipt, intent, status)
+
+
+def main():
+    os.umask(0o077)
+    while raw := sys.stdin.buffer.readline(MAX_REQUEST + 1):
+        oversized = len(raw) > MAX_REQUEST
+        try:
+            if oversized:
+                raise GateError("The Google provider request is too large")
+            response = handle(raw if raw.endswith(b"\n") else raw + b"\n")
+        except GateError as error:
+            response = json.dumps({"status": "error", "error": str(error)}).encode()
+        except (OSError, subprocess.SubprocessError):
+            response = b'{"status":"error","error":"The Google provider or calendar push receipt is unavailable"}'
+        sys.stdout.buffer.write(response if response.endswith(b"\n") else response + b"\n")
+        sys.stdout.buffer.flush()
+        if oversized:
+            break
+
+
+if __name__ == "__main__":
+    main()

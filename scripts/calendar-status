@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Preview remote and local changes using the private Caldir profile."""
+from calendar_store import CalendarError, calendar_lock, handle_error
+from calendar_sync import checked_remote_command
+
+try:
+    with calendar_lock(wait=False):
+        success, output = checked_remote_command("status")
+        if not success:
+            raise CalendarError("Google Calendar status is unavailable")
+        if output:
+            print(output)
+except (CalendarError, OSError, ValueError) as error:
+    raise SystemExit(handle_error(error))

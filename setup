@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Install a digest-bound runtime and connect a dedicated, direct Google profile."""
+from __future__ import annotations
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import time
+import tomllib
+import urllib.request
+import sys
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "scripts"))
+import calendar_goa
+BIN_NAMES = ("caldir", "caldir-provider-google")
+MAX_ARCHIVE = 32 * 1024 * 1024
+
+
+def private_dir(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symbolic link: {path}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+
+def locations() -> tuple[Path, Path, Path]:
+    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-calendar"
+    data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "omarchy-calendar"
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return config, data, state
+
+
+def prepare_profile(config: Path, data: Path) -> None:
+    for path in (config, config / "caldir", data, data / "calendars"):
+        private_dir(path)
+    path = config / "caldir/config.toml"
+    expected = data / "calendars"
+    if path.is_symlink():
+        raise RuntimeError("Refusing a symbolic link for the calendar configuration")
+    if path.exists():
+        value = tomllib.loads(path.read_text())
+        if Path(value.get("calendar_dir", "")).expanduser().resolve() != expected.resolve():
+            raise RuntimeError("The private profile points outside its dedicated calendar directory")
+        path.chmod(0o600)
+    else:
+        path.write_text("calendar_dir = " + json.dumps(str(expected)) + "\n")
+        path.chmod(0o600)
+
+
+def install_runtime(data: Path, state: Path) -> None:
+    spec = json.loads((ROOT / "runtime.json").read_text())
+    arch = {"arm64": "aarch64"}.get(platform.machine(), platform.machine())
+    asset = spec["assets"].get(arch)
+    if not asset:
+        raise RuntimeError(f"Unsupported architecture: {arch}")
+    target = data / "bin"
+    patch_name = spec.get("provider_patch")
+    patch_sha = hashlib.sha256((ROOT / patch_name).read_bytes()).hexdigest() if patch_name else None
+    recipe_sha = hashlib.sha256((ROOT / "build-runtime").read_bytes()).hexdigest() if patch_name else None
+    if target.is_symlink():
+        raise RuntimeError("Refusing a symbolic link for the runtime")
+    installed = target / "BUILD-INFO.json"
+    if installed.is_file():
+        info = json.loads(installed.read_text())
+        patch_matches = info.get("provider_patch_sha256") == patch_sha and info.get("build_recipe_sha256") == recipe_sha
+        expected = dict(asset.get("binaries", info.get("binaries", {})))
+        if patch_name and patch_matches:
+            expected["caldir-provider-google"] = info.get("binaries", {}).get("caldir-provider-google")
+        if info.get("archive_sha256") == asset["sha256"] and patch_matches and all(
+            (target / name).is_file() and not (target / name).is_symlink()
+            and hashlib.sha256((target / name).read_bytes()).hexdigest() == expected.get(name)
+            for name in BIN_NAMES
+        ):
+            print("Проверенный Caldir уже установлен.")
+            return
+    print(f"Загрузка Caldir {spec['version']} и проверка SHA-256…", flush=True)
+    request = urllib.request.Request(asset["url"], headers={"User-Agent": "Omarchy-Calendar-Setup/1.1"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        if not response.url.startswith("https://"):
+            raise RuntimeError("Refusing an insecure download redirect")
+        payload = response.read(MAX_ARCHIVE + 1)
+    if len(payload) > MAX_ARCHIVE or hashlib.sha256(payload).hexdigest() != asset["sha256"]:
+        raise RuntimeError("The Caldir archive failed its size or SHA-256 check")
+    with tempfile.TemporaryDirectory(prefix=".runtime-", dir=data) as temporary:
+        staging = Path(temporary) / "bin"
+        staging.mkdir(mode=0o700)
+        hashes = {}
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            members = archive.getmembers()
+            for name in BIN_NAMES:
+                matches = [m for m in members if m.name in (name, "./" + name)]
+                if len(matches) != 1 or not matches[0].isreg() or not 0 < matches[0].size < MAX_ARCHIVE:
+                    raise RuntimeError(f"Unexpected archive entry: {name}")
+                stream = archive.extractfile(matches[0])
+                if stream is None:
+                    raise RuntimeError(f"Missing archive entry: {name}")
+                binary = stream.read(MAX_ARCHIVE + 1)
+                if len(binary) != matches[0].size:
+                    raise RuntimeError("Incomplete runtime archive")
+                (staging / name).write_bytes(binary)
+                (staging / name).chmod(0o755)
+                hashes[name] = hashlib.sha256(binary).hexdigest()
+                if name in asset.get("binaries", {}) and hashes[name] != asset["binaries"][name]:
+                    raise RuntimeError(f"Unexpected runtime binary digest: {name}")
+        if patch_name:
+            print("Сборка и проверка исправленного Google provider…", flush=True)
+            subprocess.run([str(ROOT / "build-runtime"), str(staging / "caldir-provider-google")], check=True)
+            hashes["caldir-provider-google"] = hashlib.sha256((staging / "caldir-provider-google").read_bytes()).hexdigest()
+        info = {"version": spec["version"], "source_commit": spec["commit"],
+                "url": asset["url"], "archive_sha256": asset["sha256"], "binaries": hashes}
+        info.update(provider_patch_sha256=patch_sha, build_recipe_sha256=recipe_sha)
+        (staging / "BUILD-INFO.json").write_text(json.dumps(info, indent=2) + "\n")
+        (staging / "BUILD-INFO.json").chmod(0o600)
+        backup = None
+        if target.exists():
+            backups = state / "omarchy-project/backups"
+            private_dir(backups)
+            backup = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-calendar-runtime-"), dir=backups)) / "bin"
+            shutil.move(str(target), str(backup))
+        try:
+            staging.rename(target)
+        except BaseException:
+            if backup and backup.exists():
+                shutil.move(str(backup), str(target))
+            raise
+        print("Caldir установлен; контрольная сумма совпала.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Подключение Google Calendar через GNOME Online Accounts")
+    parser.add_argument("--binaries-only", action="store_true", help="Подготовить Caldir без входа в Google")
+    args = parser.parse_args()
+    os.umask(0o077)
+    config, data, state = locations()
+    prepare_profile(config, data)
+    install_runtime(data, state)
+    if args.binaries_only:
+        print("Готово. Для подключения Google откройте календарь и нажмите «Подключить Google».")
+        return
+    print("\nВойдите в Google через «Сетевые учётные записи» и включите календарь.\n"
+          "Собственный проект Google Cloud не требуется.\n", flush=True)
+    mapping = config / "goa.json"
+    linked_identity = json.loads(mapping.read_text()).get("identity") if mapping.exists() else None
+    try:
+        available = calendar_goa.accounts()
+    except Exception:
+        available = {}
+    if not available or (linked_identity and linked_identity not in available):
+        if not shutil.which("gnome-online-accounts-gtk"):
+            raise RuntimeError("Установите gnome-online-accounts и gnome-online-accounts-gtk")
+        manager = subprocess.Popen([str(ROOT / "scripts/calendar-online-accounts")])
+        deadline = time.monotonic() + 900
+        while (not available or (linked_identity and linked_identity not in available)) and time.monotonic() < deadline:
+            time.sleep(3)
+            try:
+                available = calendar_goa.accounts()
+            except Exception:
+                available = {}
+            if (not available or (linked_identity and linked_identity not in available)) and manager.poll() is not None:
+                if manager.returncode!=10 or not calendar_goa.manager_running():
+                    raise RuntimeError("Окно входа закрыто. Повторите подключение после добавления Google.")
+        if not available or (linked_identity and linked_identity not in available):
+            raise RuntimeError("Вход в Google пока не завершён. Повторите подключение после входа.")
+    if mapping.exists():
+        identity = json.loads(mapping.read_text())["identity"]
+    elif len(available) == 1:
+        identity = next(iter(available))
+    else:
+        identities = sorted(available)
+        for number, identity in enumerate(identities, 1):
+            print(f"{number}. {identity}")
+        choice = int(input("Номер аккаунта: "))
+        if not 1 <= choice <= len(identities):
+            raise ValueError("Неверный номер аккаунта")
+        identity = identities[choice - 1]
+    calendar_goa.connect_primary(config, data, identity)
+    subprocess.run([str(ROOT / "scripts/calendar-pull"), "--pending"], check=True, stdout=subprocess.DEVNULL)
+    print("Google подключён. Календарь загружен.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"Настройка не завершена: {error}") from None

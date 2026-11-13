@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "re_pick.google-calendar-clock",
+  "name": "Google Calendar OAuth — No Google Cloud Project",
+  "version": "1.1",
+  "author": "i4w7w4a",
+  "description": "Google Calendar with Google OAuth sign-in through GNOME Online Accounts. No personal Google Cloud project required. Automatic sync, event durations and reminders. Google Calendar only; no iCloud backend.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Calendar OAuth — No Google Cloud Project",
+    "description": "Google OAuth calendar and clock with automatic sync, duration and reminder controls",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  },
+  "license": "MIT"
+}
