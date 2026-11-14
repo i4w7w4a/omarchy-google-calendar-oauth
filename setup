@@ -82,7 +82,7 @@ def install_runtime(data: Path, state: Path) -> None:
             print("Проверенный Caldir уже установлен.")
             return
     print(f"Загрузка Caldir {spec['version']} и проверка SHA-256…", flush=True)
-    request = urllib.request.Request(asset["url"], headers={"User-Agent": "Omarchy-Calendar-Setup/1.1"})
+    request = urllib.request.Request(asset["url"], headers={"User-Agent": "Omarchy-Calendar-Setup/1.2"})
     with urllib.request.urlopen(request, timeout=45) as response:
         if not response.url.startswith("https://"):
             raise RuntimeError("Refusing an insecure download redirect")

@@ -1,10 +1,10 @@
 # Google Calendar OAuth — No Google Cloud Project
 
-**Версия 1.1 · [English](README.en.md)**
+**Версия 1.2 · [English](README.en.md)**
 
 Google Calendar в центральной панели Omarchy: вход через **Google OAuth с помощью GNOME Online Accounts**, автоматическая отправка событий, выбор длительности и напоминания. **Собственный проект в Google Cloud Console не требуется.** Это интеграция именно с Google Calendar; iCloud не используется и не поддерживается.
 
-![Google Calendar OAuth 1.1 — календарь и настройки](preview.png)
+![Google Calendar OAuth — календарь и настройки](preview.png)
 
 На скриншоте — демонстрационные данные.
 
@@ -73,7 +73,7 @@ GNOME Online Accounts выполняет OAuth и хранит долгожив�
 
 Если Google отвечает `403 insufficientPermissions`, согласие Calendar не было выдано: переподключите Google в Online Accounts с отмеченным Calendar и снова нажмите «Подключить Google».
 
-Профиль: `~/.config/omarchy-calendar/`. События: `~/.local/share/omarchy-calendar/calendars/`. Очередь и кэш: `~/.local/state/omarchy-calendar/`. Они не входят в репозиторий. Плагин работает с правами вашего пользователя внутри Omarchy Shell; это не отдельная песочница. [Подробности безопасности](SECURITY.md).
+Профиль: `~/.config/omarchy-calendar/`. События: `~/.local/share/omarchy-calendar/calendars/`. Очередь, кэш и отметки отправленных напоминаний: `~/.local/state/omarchy-calendar/`. Они не входят в репозиторий. Содержимое напоминаний передаётся через стандартный ввод и D-Bus пользовательского сеанса, без названий событий и ссылок в аргументах процессов. Плагин работает с правами вашего пользователя внутри Omarchy Shell; это не отдельная песочница. [Подробности безопасности](SECURITY.md).
 
 ## Закреплённый runtime и проверки
 

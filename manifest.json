@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "re_pick.google-calendar-clock",
   "name": "Google Calendar OAuth — No Google Cloud Project",
-  "version": "1.1",
+  "version": "1.2",
   "author": "i4w7w4a",
   "description": "Google Calendar with Google OAuth sign-in through GNOME Online Accounts. No personal Google Cloud project required. Automatic sync, event durations and reminders. Google Calendar only; no iCloud backend.",
   "kinds": [

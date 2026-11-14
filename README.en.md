@@ -1,10 +1,10 @@
 # Google Calendar OAuth — No Google Cloud Project
 
-**Version 1.1 · [Русский](README.md)**
+**Version 1.2 · [Русский](README.md)**
 
 Your Google Calendar in the Omarchy bar, with **Google OAuth sign-in through GNOME Online Accounts**. No personal Google Cloud Console project or OAuth client registration is required. This plugin connects to **Google Calendar**, not iCloud.
 
-![Google Calendar OAuth 1.1 — calendar and settings](preview.png)
+![Google Calendar OAuth — calendar and settings](preview.png)
 
 The screenshot uses demonstration data.
 
@@ -66,7 +66,7 @@ GNOME Online Accounts handles OAuth and retains long-lived credentials in the sy
 
 A `403 insufficientPermissions` response means Calendar was not granted: reconnect Google in Online Accounts, select Calendar on the consent screen, and run Connect Google again.
 
-The dedicated profile is under `~/.config/omarchy-calendar/`, events under `~/.local/share/omarchy-calendar/calendars/`, and queue/cache under `~/.local/state/omarchy-calendar/`. None is included in this repository. Omarchy plugins run as your user inside the shell; the plugin itself is not sandboxed. See [SECURITY.md](SECURITY.md).
+The dedicated profile is under `~/.config/omarchy-calendar/`, events under `~/.local/share/omarchy-calendar/calendars/`, and queue/cache and reminder deduplication state under `~/.local/state/omarchy-calendar/`. None is included in this repository. Reminder contents are passed through standard input and the user's D-Bus session, without event names or links in process arguments. Omarchy plugins run as your user inside the shell; the plugin itself is not sandboxed. See [SECURITY.md](SECURITY.md).
 
 ## Runtime and validation
 

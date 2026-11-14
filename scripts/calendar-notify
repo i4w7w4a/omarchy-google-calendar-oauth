@@ -1,15 +1,215 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/python3
+"""Send a reminder from a private stdin pipe to the desktop session bus."""
 
-if (($# < 1 || $# > 2)) || [[ -z $1 ]]; then
-  echo "Usage: calendar-notify <headline> [description]" >&2
-  exit 64
-fi
-headline=$1
-body=${2:-}
-# The notification CLI accepts flags after its positional text.
-[[ $headline != -* ]] || headline=$'\u2060'$headline
-[[ $body != -* ]] || body=$'\u2060'$body
-args=(-g "󰃭" -u normal --app-name "re_pick.google-calendar-clock" "$headline")
-[[ -z $body ]] || args+=("$body")
-exec omarchy notification send "${args[@]}" --exec omarchy-shell shell summon re_pick.google-calendar-clock '{}'
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from threading import Timer
+
+from calendar_store import CalendarError, MAX_CACHE_BYTES, STATE_DIR, atomic_json, read_bounded
+
+
+APP_ID = "re_pick.google-calendar-clock"
+CLICK_ARGV = ["omarchy-shell", "shell", "summon", APP_ID, "{}"]
+NOTIFICATIONS = "org.freedesktop.Notifications"
+CALL_TIMEOUT_MS = 3000
+STATE_LIMIT = MAX_CACHE_BYTES
+RETENTION = timedelta(hours=12)
+MARKUP = str.maketrans("<>&", "＜＞＆")
+CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def request(limit):
+    raw = sys.stdin.buffer.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError
+    return value
+
+
+def digest(key):
+    if not isinstance(key, str) or not 0 < len(key) <= 4096 or CONTROLS.search(key):
+        raise ValueError
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def text(value, limit):
+    if not isinstance(value, str) or len(value) > limit:
+        raise ValueError
+    # StyledText sinks can decode entities before interpreting tags.
+    clean = CONTROLS.sub("", value).translate(MARKUP)
+    clean.encode("utf-8", errors="strict")
+    return clean
+
+
+def meeting_link(value):
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError
+    # The panel selects an approved conference URL. Keep query ampersands
+    # intact while screening out markup and recursively decoded entities.
+    if value and (not re.fullmatch(r"https://[^\s<>\"'\\\x00-\x1f\x7f-\x9f]+", value, re.IGNORECASE)
+                  or re.search(r"&(?:#\d+|#x[0-9a-f]+|[a-z]+)(?:;|$)", value, re.IGNORECASE)):
+        raise ValueError
+    value.encode("utf-8", errors="strict")
+    return value
+
+
+@contextmanager
+def private_state():
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = os.open(STATE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(directory).st_uid != os.geteuid():
+            raise PermissionError
+        os.fchmod(directory, 0o700)
+        descriptor = os.open("reminders.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o600, dir_fd=directory)
+        with os.fdopen(descriptor, "wb") as lock:
+            info = os.fstat(lock.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                raise PermissionError
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            yield Path(f"/proc/self/fd/{directory}") / "reminders.json"
+    finally:
+        os.close(directory)
+
+
+def recent_entries(entries, now, *, legacy=False):
+    recent = {}
+    for key, timestamp in entries.items():
+        try:
+            sent = datetime.fromisoformat(timestamp)
+            if not now - RETENTION <= sent <= now + timedelta(minutes=1):
+                continue
+            if legacy:
+                key = digest(key)
+            elif not re.fullmatch(r"[0-9a-f]{64}", key):
+                continue
+            recent[key] = sent.astimezone(timezone.utc).isoformat()
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return recent
+
+
+def load_state(state, now):
+    try:
+        info = state.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise PermissionError
+        state.chmod(0o600)
+        entries = json.loads(read_bounded(state, STATE_LIMIT))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(entries, dict):
+        raise ValueError
+    return recent_entries(entries, now)
+
+
+def send(headline, body):
+    # Wire-level GDBus debugging can print the complete Notify message.
+    os.environ.pop("G_DBUS_DEBUG", None)
+    try:
+        from gi.repository import Gio, GLib
+    except (ImportError, ValueError):
+        return fail("Gio (python-gobject) is required to send calendar notifications.", 127)
+
+    # Use the existing local session bus. Connecting explicitly avoids
+    # GDBus attempting to launch a substitute bus if the session is missing.
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if not address or not all(part.startswith("unix:") for part in address.split(";")):
+        return fail("The desktop session bus is unavailable.", 69)
+
+    cancel = Gio.Cancellable()
+    timeout = Timer(CALL_TIMEOUT_MS / 1000, cancel.cancel)
+    timeout.daemon = True
+    timeout.start()
+    try:
+        flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+        bus = Gio.DBusConnection.new_for_address_sync(address, flags, None, cancel)
+    except GLib.Error:
+        return fail("The desktop session bus is unavailable.", 69)
+    finally:
+        timeout.cancel()
+
+    try:
+        owner = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                              "GetNameOwner", GLib.Variant("(s)", (NOTIFICATIONS,)),
+                              GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, CALL_TIMEOUT_MS, None).unpack()[0]
+    except GLib.Error:
+        # Querying the bus daemon has not sent the notification yet.
+        return fail("Could not reach the desktop notification service.", 69)
+
+    try:
+        hints = {
+            "urgency": GLib.Variant("y", 1),
+            "omarchy-glyph": GLib.Variant("s", "󰃭"),
+            "omarchy-exec-argv": GLib.Variant("s", json.dumps(CLICK_ARGV, separators=(",", ":"))),
+        }
+        message = GLib.Variant("(susssasa{sv}i)", (APP_ID, 0, "", headline, body, [], hints, -1))
+        bus.call_sync(owner, "/org/freedesktop/Notifications", NOTIFICATIONS,
+                      "Notify", message, GLib.VariantType.new("(u)"),
+                      Gio.DBusCallFlags.NO_AUTO_START, CALL_TIMEOUT_MS, None)
+    except GLib.Error:
+        # Do not log server-controlled diagnostics. Retry automatically only
+        # if the message was never delivered to a notification server.
+        return fail("Could not reach the desktop notification service.", 1)
+    return 0
+
+
+def fail(message, status):
+    print(f"calendar-notify: {message}", file=sys.stderr)
+    return status
+
+
+def main():
+    migrate = sys.argv[1:] == ["--migrate"]
+    if sys.argv[1:] and not migrate:
+        return fail("Expected a JSON object on stdin.", 64)
+    try:
+        payload = request(STATE_LIMIT if migrate else 32 * 1024)
+        if not migrate:
+            if set(payload) != {"key", "headline", "body", "link"}:
+                raise ValueError
+            key = digest(payload["key"])
+            headline = text(payload["headline"], 2048)
+            body = text(payload["body"], 2048)
+            link = meeting_link(payload["link"])
+            if not headline:
+                raise ValueError
+            if link:
+                body += "\n" + link
+    except (OSError, ValueError, RecursionError):
+        return fail("Invalid calendar notification input.", 64)
+
+    try:
+        with private_state() as state:
+            now = datetime.now(timezone.utc)
+            entries = load_state(state, now)
+            if migrate:
+                for key, timestamp in recent_entries(payload, now, legacy=True).items():
+                    entries[key] = max(entries.get(key, timestamp), timestamp)
+            else:
+                if key in entries:
+                    return 0
+                status = send(headline, body)
+                if status:
+                    return status
+                entries[key] = now.isoformat()
+            atomic_json(state, entries)
+    except (OSError, ValueError, CalendarError, RecursionError):
+        return fail("Could not update the private reminder state.", 74)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

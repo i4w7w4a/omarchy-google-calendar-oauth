@@ -26,7 +26,7 @@ Panel {
   Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
   // Keep this in step with manifest.json so the installed panel can identify
   // its release without reading files from Quickshell's sandbox.
-  readonly property string pluginVersion: "1.1"
+  readonly property string pluginVersion: "1.2"
 
   property var anchorItem: null
 
@@ -193,6 +193,8 @@ Panel {
   //      sweep re-evaluate without polling timers.
   property date eventClock: new Date()
   property var reminderQueue: []
+  property string reminderMinute: ""
+  property var reminderKeys: Object.create(null)
   property bool eventNotificationsEnabled: String(setting("eventNotifications", "true")).toLowerCase() !== "false"
   readonly property string calendarPanelPosition: String(setting("calendarPanelPosition", "original")).toLowerCase() === "screen-center"
     ? "screen-center" : "original"
@@ -888,66 +890,64 @@ Panel {
   // A minute is evaluated once across the bar's screens. Saved keys also
   // prevent duplicate notifications if Shell restarts in that minute.
   function evaluateEventReminders() {
-    if (!root.eventNotificationsEnabled || !ownsBackgroundWork() || root.calendarEvents.length === 0) return
+    if (!ownsBackgroundWork()) return
+    if (hasLegacyReminders()) {
+      if (!reminderProcess.running) {
+        var legacy = root.settings.calendarNotified
+        try {
+          if (typeof legacy === "string") legacy = JSON.parse(legacy)
+        } catch (error) {
+          legacy = null
+        }
+        if (!legacy || typeof legacy !== "object" || Array.isArray(legacy)) legacy = {}
+        reminderProcess.startRequest({ payload: JSON.stringify(legacy) }, true)
+      }
+      return
+    }
+    if (!root.eventNotificationsEnabled || root.calendarEvents.length === 0) return
     var now = root.eventClock
-    var notified = root.parseNotifiedMap()
-    var changed = root.pruneNotifiedMap(notified, now)
+    var minute = String(Math.floor(now.getTime() / 60000))
+    if (reminderMinute !== minute) {
+      reminderMinute = minute
+      reminderKeys = Object.create(null)
+    }
     var queued = []
     for (var i = 0; i < root.calendarEvents.length; i++) {
       var event = root.calendarEvents[i]
       var offsets = CalendarModel.dueReminderOffsets(event, now.getTime())
       for (var j = 0; j < offsets.length; j++) {
         var notifyKey = root.eventKeyFor(event) + "|" + offsets[j]
-        if (notified[notifyKey]) continue
-        notified[notifyKey] = now.toISOString()
-        queued.push(root.reminderArguments(event, offsets[j]))
-        changed = true
+        if (reminderKeys[notifyKey]) continue
+        reminderKeys[notifyKey] = true
+        queued.push({ payload: root.reminderPayload(event, offsets[j], notifyKey), minute: minute })
       }
     }
-    if (changed) root.persistSettings({ calendarNotified: JSON.stringify(notified) })
     if (queued.length > 0) {
       reminderQueue = reminderQueue.concat(queued)
       sendNextReminder()
     }
   }
 
-  function parseNotifiedMap() {
-    try {
-      var parsed = JSON.parse(String(setting("calendarNotified", "{}")))
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed
-    } catch (error) {}
-    return {}
+  function hasLegacyReminders() {
+    return root.settings && Object.prototype.hasOwnProperty.call(root.settings, "calendarNotified")
   }
 
-  function pruneNotifiedMap(notified, now) {
-    var cutoff = now.getTime() - 12 * 60 * 60 * 1000
-    var changed = false
-    for (var key in notified) {
-      var time = new Date(String(notified[key])).getTime()
-      if (isNaN(time) || time < cutoff) {
-        delete notified[key]
-        changed = true
-      }
-    }
-    return changed
-  }
-
-  function reminderArguments(event, offset) {
-    var title = CalendarModel.notificationTitle(event.title || strings.t("message.s10"))
+  function reminderPayload(event, offset, key) {
+    var title = CalendarModel.boundedText(event.title || strings.t("message.s10"), 2048)
+      .replace(/[\ud800-\udbff]$/, "")
     var start = new Date(CalendarModel.eventStartTime(event))
     var time = event.all_day ? strings.t("message.s11") : start.toLocaleString(labelLocale, "d MMM, HH:mm")
     var description = (offset === 0 ? strings.t("detail.s11")
       : strings.tn("reminder.startsIn", offset).arg(I18n.formatNumber(offset))) + "\n" + time
     var links = CalendarModel.eventMeetingLinks(event)
-    if (links.length > 0) description += "\n" + links[0]
-    return [root.helperPath("calendar-notify"), title, description]
+    return JSON.stringify({ key: key, headline: title, body: description, link: links[0] || "" })
   }
 
   function sendNextReminder() {
-    if (reminderProcess.running || reminderQueue.length === 0) return
-    reminderProcess.command = reminderQueue[0]
+    if (reminderProcess.running || reminderQueue.length === 0 || hasLegacyReminders()) return
+    var item = reminderQueue[0]
     reminderQueue = reminderQueue.slice(1)
-    reminderProcess.running = true
+    reminderProcess.startRequest(item, false)
   }
 
   function lastPullLabel() {
@@ -1170,9 +1170,12 @@ Panel {
   // preference rather than doing nothing. The host widget builds its own
   // entry when the label format is cycled, so it has to be kept in step or
   // it would write this key straight back out from a stale copy.
-  function persistSettings(values) {
+  function persistSettings(values, removeLegacyReminders) {
     var entry = { id: root.moduleName }
-    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var existing in root.settings) {
+      if (existing !== "id" && !(removeLegacyReminders && existing === "calendarNotified"))
+        entry[existing] = root.settings[existing]
+    }
     for (var key in values) entry[key] = values[key]
 
     root.settings = entry
@@ -1592,10 +1595,50 @@ Panel {
 
   Process {
     id: reminderProcess
+    property var item: null
+    property bool migrating: false
+
+    function startRequest(next, migrate) {
+      item = next
+      migrating = migrate
+      command = migrate ? [root.helperPath("calendar-notify"), "--migrate"]
+                        : [root.helperPath("calendar-notify")]
+      stdinEnabled = true
+      running = true
+    }
+
+    onStarted: {
+      write(item.payload + "\n")
+      stdinEnabled = false
+    }
+
     onExited: function(exitCode) {
       if (exitCode !== 0)
         root.calendarSyncMessage = strings.t("detail.s31")
+      if (!migrating && exitCode === 69 && !item.retried) {
+        reminderRetry.items = reminderRetry.items.concat([{ payload: item.payload, minute: item.minute, retried: true }])
+        if (!reminderRetry.running) reminderRetry.start()
+      }
+      if (migrating && exitCode === 0) {
+        root.persistSettings({}, true)
+        Qt.callLater(root.evaluateEventReminders)
+      }
+      item = null
       Qt.callLater(root.sendNextReminder)
+    }
+  }
+
+  Timer {
+    id: reminderRetry
+    property var items: []
+    interval: 2000
+    onTriggered: {
+      var minute = String(Math.floor(Date.now() / 60000))
+      if (root.eventNotificationsEnabled) {
+        root.reminderQueue = root.reminderQueue.concat(items.filter(function(item) { return item.minute === minute }))
+        root.sendNextReminder()
+      }
+      items = []
     }
   }
 
